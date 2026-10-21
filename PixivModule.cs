@@ -31,16 +31,32 @@ public class PixivConfig
     public string ProxyUrl { get; set; } = "";
 
     [DisplayName("搜图·排除标签")]
-    [Description("命中这些标签的作品不搜也不发，多个用逗号或顿号分隔。判定是包含式：填 AI 也能挡掉 AIイラスト、AI生成")]
+    [Description("命中这些标签的作品不搜也不发，多个用逗号或顿号分隔。判定是包含式：填 AI 也能挡掉 AIイラスト、AI生成。按ID或链接直发也会拦——只要配了代理、详情读得出来（没配代理时按ID直发读不到标签，只能不拦，回报里会写明这次没做检查）")]
     public string ExcludeTags { get; set; } = "AI,R-18,R-18G,裸足";
 
     [DisplayName("搜图·最低收藏数")]
-    [Description("0=不筛。填上之后候选会走作品详情读真实收藏数（实测收藏数只在详情接口里给），并按步长取最多12条样逐条请，一次搜索因此要多花十几秒。免登录只搜得到最新上传的几页，收藏数普遍个位到几十，门槛设上百基本全军覆没")]
+    [Description("0=不筛。填上之后候选会走作品详情读真实收藏数（实测收藏数只在详情接口里给），并按步长取最多「抽几条读详情」那么多条逐条请，一次搜索因此要多花十几秒。免登录只搜得到最新上传的几页，收藏数普遍个位到几十，门槛设上百基本全军覆没")]
     public int MinBookmarks { get; set; } = 0;
+
+    [DisplayName("搜图·人气翻几页")]
+    [Description("按收藏数排时先翻几页当候选池，默认3（实测每页约59条、页与页不重叠）。免登录没有服务端人气榜，只能多翻几页再本地排；翻得多排得准但更慢")]
+    public int PopularPages { get; set; } = 3;
+
+    [DisplayName("搜图·抽几条读详情")]
+    [Description("候选池按步长抽几条去作品详情接口读真实收藏数（PixivArtist 列同画师作品时也用它当逐条核验的上限），默认12。这条决定一次搜索多花几秒")]
+    public int ProbeSampleCount { get; set; } = 12;
 
     [DisplayName("搜图·关键词映射")]
     [Description("中文关键词转成Pixiv上真正在用的tag，格式 中文=日文，多条用分号分隔。留空只用内置表，填了则在内置表基础上覆盖")]
     public string KeywordMap { get; set; } = "";
+
+    [DisplayName("发送·放行R-18")]
+    [Description("默认关：PixivSend 按ID或链接直发时也会读作品详情，xRestrict 不为0（参考插件的判定：1=R-18、2=R-18G；本机免登录只实测到0）就直接拒发。未登录搜索本来就搜不到这类，只有用户自己给ID才会撞上；参考插件那套是按会话白名单放行，这里没会话概念，就做成这一个开关")]
+    public bool AllowR18 { get; set; } = false;
+
+    [DisplayName("发送·一次最多几张")]
+    [Description("PixivSendMulti 的条数上限，默认6（参考插件的 max_count 就是这项）。调用方要得再多也按这个数截住，1-10")]
+    public int MaxBatchCount { get; set; } = 6;
 
     [DisplayName("发送·合并转发")]
     [Description("开启后一次发多张图合成一条合并转发消息，不刷屏；失败自动退回逐条发送。三端都注册了 send_forward_msg 动作，但未实机验证")]
@@ -76,7 +92,7 @@ public class PixivConfig
 }
 
 [Module("P站图片搜索发送",
-    "免登录搜 Pixiv 作品并把原图以QQ图片消息发出：关键词搜图取候选、按作品ID或链接直接发、一次批量发多张（可合并转发）、取同画师的其他作品；带排除标签、收藏数门槛、中文关键词转tag、发过的自动去重、本地缓存自动清理",
+    "免登录搜 Pixiv 作品并把原图以QQ图片消息发出：关键词搜图取候选、按作品ID或链接直接发、一次批量发多张（可合并转发）、取同画师的其他作品；带排除标签、收藏数门槛、中文关键词转tag、发过的自动去重、本地缓存自动清理；按ID或链接直发也会先读详情过分级与排除标签这道闸门（要配代理才读得到）",
     defaultCategory: "苏染的工具")]
 public class PixivModule(
     XmlFunctionCaller functionCaller,
@@ -96,11 +112,12 @@ public class PixivModule(
     const string LedgerName = "sent_records.json";
     const int MaxResults = 20;
     const int ProbeTimeoutSeconds = 8;
-    const int BookmarksProbeLimit = 12;
-    const int MaxBatchSend = 6;
-    // 免登录没有人气排序，只能把最新上传的前几页当候选池本地排（实测 p=1..3 各回约59条且不重叠）
-    const int PopularSearchPages = 3;
     const int PopularityPoolSize = 120;
+
+    // 免登录没有人气排序，只能把最新上传的前几页当候选池本地排（实测 p=1..3 各回约59条且不重叠）
+    int PopularPages => Math.Clamp(Configuration.PopularPages, 1, 5);
+    int SampleCount => Math.Clamp(Configuration.ProbeSampleCount, 1, 20);
+    int BatchLimit => Math.Clamp(Configuration.MaxBatchCount, 1, 10);
 
     // 中文口头说法 → Pixiv 上实际在用的 tag（照着 KiraAI 那份插件的表搬的，那些词是P站搜得到图的词）
     static readonly Dictionary<string, string> BuiltInKeywordMap = new()
@@ -137,7 +154,7 @@ public class PixivModule(
                 + "中文关键词会自动按映射表转成P站的tag（黑丝→黒タイツ 之类），配置里还能自己加。"
                 + "搜出来的候选已经自动排掉命中排除标签的、收藏数不够的和最近发过的；发过之后24小时内不会再被搜到，避免同一张反复刷。"
                 + "用户说『这个画师的其他图』『XX画师的图』：拿任一条作品ID调 PixivArtist。"
-                + "用户直接给了作品ID或作品链接时不用搜索，也就不用代理。取不到图或发不出去先跑 PixivEnv。"
+                + "用户直接给了作品ID或作品链接时不用搜索；配了代理会先读一次详情过同一套闸门（R-18、排除标签），没配代理就取不到详情、只能直接发并在回报里写明这次没做检查。取不到图或发不出去先跑 PixivEnv。"
         };
         functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
         return Task.CompletedTask;
@@ -179,7 +196,7 @@ public class PixivModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("从Pixiv取一张原图并以QQ图片消息发出（不是文件消息）。source可以是作品ID、作品链接，也可以是搜索关键词（关键词就发筛过的第一条，走关键词需要配置代理）；page是多页作品的第几页")]
+    [Description("从Pixiv取一张原图并以QQ图片消息发出（不是文件消息）。source可以是作品ID、作品链接，也可以是搜索关键词（关键词就发筛过的第一条，走关键词需要配置代理）；page是多页作品的第几页。给ID时也会先读一次详情过同一套闸门（R-18 与排除标签，配了代理才读得到；没配代理就直接发并在回报里写明没检查）")]
     public async Task PixivSend(
         [Description("作品ID、pixiv作品链接，或搜索关键词")] string source,
         [Description("目标群号或QQ号")] long? targetId = null,
@@ -193,6 +210,7 @@ public class PixivModule(
         bool isGroup = !string.Equals(type, "private", StringComparison.OrdinalIgnoreCase);
 
         PixivHit? hit = null;
+        string note = "";
         string id = ExtractArtworkId(source);
         if (id.Length == 0)
         {
@@ -205,14 +223,35 @@ public class PixivModule(
             hit = hits[0];
             id = hit.Id;
         }
-        else if (Configuration.ProxyUrl.Trim().Length > 0)
+        else
         {
-            hit = await FetchHitAsync(id);
+            if (Configuration.ProxyUrl.Trim().Length > 0)
+            {
+                hit = await FetchHitAsync(id);
+            }
+            if (hit == null)
+            {
+                note = "（没配代理或详情没读到，这条没做分级与排除标签检查）";
+            }
+            else
+            {
+                string? blocked = BlockedBy(hit);
+                if (blocked != null)
+                {
+                    interactor.Poke("❌ 作品 " + id + "（" + hit.Title + "／" + hit.UserName + "）不发：" + blocked
+                        + "。要放行就改配置「搜图·排除标签」或开「发送·放行R-18」；未登录搜索本来就搜不到这类，只有直接给ID或链接才会走到这一步。");
+                    return;
+                }
+                if (IsRecentlySent(id))
+                {
+                    note = "（这张 " + DedupWindowText() + "内已经发过一次，你直接给了ID就照发）";
+                }
+            }
         }
 
         CleanupCache();
         PixivFile file = await DownloadAsync(id, page);
-        await SendAndReportAsync(hit, id, page, file, targetId.Value, isGroup);
+        await SendAndReportAsync(hit, id, page, file, targetId.Value, isGroup, note);
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -220,7 +259,7 @@ public class PixivModule(
     public async Task PixivSendMulti(
         [Description("搜索关键词，中文会自动过映射表")] string keyword,
         [Description("目标群号或QQ号")] long? targetId = null,
-        [Description("发几张，1-6，默认3")] int count = 3,
+        [Description("发几张，默认3；上限是配置「发送·一次最多几张」（默认6），要超了会被截到那个数")] int count = 3,
         [Description("group或private，默认group")] string? type = null,
         [Description("留空或 popular=收藏多的优先（慢）/ new=最新上传（快）")] string? order = null)
     {
@@ -228,7 +267,7 @@ public class PixivModule(
         if (targetId == null) throw new Exception("没给目标，发群里还是私聊得说一个");
         if (keyword.Trim().Length == 0) throw new Exception("没给关键词");
         bool isGroup = !string.Equals(type, "private", StringComparison.OrdinalIgnoreCase);
-        int want = Math.Clamp(count, 1, MaxBatchSend);
+        int want = Math.Clamp(count, 1, BatchLimit);
 
         string mapped = MapKeyword(keyword);
         List<PixivHit> hits = await PickAsync(mapped, want, order);
@@ -299,6 +338,7 @@ public class PixivModule(
             "✅ Pixiv「" + keyword.Trim() + "」发出 " + sentIds.Count + " 张"
                 + (Configuration.SendAsForward ? "（合并转发）" : "（逐条）") + "："
                 + string.Join("、", sentIds.Select(id => ArtworkPageBase + id))
+                + (count > want ? "（你要了 " + count + " 张，按配置「发送·一次最多几张」截到 " + want + " 张）" : "")
         };
         foreach ((PixivHit hit, PixivFile file) in ready)
         {
@@ -314,7 +354,7 @@ public class PixivModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("取同一个画师的其他作品ID（用户说『这个画师的其他图』『再来几张XX画师的』时用）。source给作品ID或作品链接最准；只给画师名或关键词时，先按关键词搜一条出来再取它画师的作品。免登录接口不给按画师直接搜，只能这样顺着作品带出来")]
+    [Description("取同一个画师的其他作品（用户说『这个画师的其他图』『再来几张XX画师的』时用）。source给作品ID或作品链接最准；只给画师名或关键词时，先按关键词搜一条出来再取它画师的作品。免登录接口不给按画师直接搜，只能这样顺着作品带出来。同作者列表实测只给一堆作品ID，所以插件按ID从新到旧逐条开详情，标题/标签/收藏数都补齐并先过一遍排除标签与R-18（核几条的上限就是配置「搜图·抽几条读详情」），没轮上的只列ID并说明")]
     public async Task PixivArtist(
         [Description("作品ID、作品链接，或者画师名/关键词")] string source,
         [Description("返回几条，1-20，默认10")] int count = 10)
@@ -336,28 +376,62 @@ public class PixivModule(
 
         JsonElement detail = await GetJsonAsync(IllustBase + seedId, RequireProxy(), TimeoutSeconds(false));
         string artist = GetText(detail, "userName");
-        List<string> ids = new();
+        int want = Math.Clamp(count, 1, MaxResults);
+        List<string> verified = new();
+        List<string> unverified = new();
+        List<string> blocked = new();
         if (detail.TryGetProperty("userIllusts", out JsonElement userIllusts) && userIllusts.ValueKind == JsonValueKind.Object)
         {
-            foreach (JsonProperty entry in userIllusts.EnumerateObject())
+            // 实测 userIllusts 是个 {作品ID: null} 的表，标题标签都不给，只能逐条开详情——所以只核前 min(要几条, 抽几条读详情) 条
+            List<string> ordered = userIllusts.EnumerateObject()
+                .Where(entry => entry.Name != seedId && IsRecentlySent(entry.Name) == false)
+                .Select(entry => entry.Name)
+                .OrderByDescending(id => id.Length).ThenByDescending(id => id)
+                .ToList();
+            int probeLimit = Math.Min(want, SampleCount);
+            foreach (string id in ordered.Take(probeLimit))
             {
-                if (entry.Name != seedId && IsRecentlySent(entry.Name) == false)
+                PixivHit? hit = await FetchHitAsync(id);
+                if (hit == null)
                 {
-                    ids.Add(entry.Name);
+                    unverified.Add(id);
+                    continue;
+                }
+                string? reason = BlockedBy(hit);
+                if (reason == null)
+                {
+                    verified.Add("- " + Describe(hit));
+                }
+                else
+                {
+                    blocked.Add(id + "：" + reason);
                 }
             }
+            unverified.AddRange(ordered.Skip(probeLimit).Take(Math.Max(0, want - verified.Count)));
         }
-        ids = ids.OrderByDescending(id => id.Length).ThenByDescending(id => id).Take(Math.Clamp(count, 1, MaxResults)).ToList();
-        if (ids.Count == 0)
+        if (verified.Count == 0 && unverified.Count == 0)
         {
-            interactor.Poke("作品 " + seedId + " 的画师 " + artist + " 这边列不出别的作品（免登录接口没给同作者列表，或只剩这一条）。");
+            interactor.Poke("作品 " + seedId + " 的画师 " + artist + " 这边列不出别的作品（免登录接口没给同作者列表，或只剩这一条"
+                + (blocked.Count > 0 ? "，另有 " + blocked.Count + " 条被拦：" + string.Join("；", blocked.Take(5)) : "") + "）。");
             return;
         }
         List<string> lines = new()
         {
-            "画师 " + artist + " 的其他作品 " + ids.Count + " 条 " + fromNote + "（按ID从新到旧，未登录列表给不出标题和标签，得逐条打开才知道）："
+            "画师 " + artist + " 的其他作品：核过 " + (verified.Count + blocked.Count) + " 条，通过 " + verified.Count + " 条"
+                + (blocked.Count > 0 ? "、拦掉 " + blocked.Count + " 条" : "")
+                + (unverified.Count > 0 ? "，另有 " + unverified.Count + " 条没逐条核（列表只给ID）" : "")
+                + " " + fromNote + "（按ID从新到旧，ID越大越新）："
         };
-        lines.AddRange(ids.Select(id => "- " + id + " " + ArtworkPageBase + id));
+        lines.AddRange(verified);
+        if (unverified.Count > 0)
+        {
+            lines.Add("没核的ID（发的时候 PixivSend 还会再过一遍排除标签与R-18）：");
+            lines.AddRange(unverified.Select(id => "- " + id + " " + ArtworkPageBase + id));
+        }
+        if (blocked.Count > 0)
+        {
+            lines.Add("拦掉的：" + string.Join("；", blocked.Take(8)));
+        }
         lines.Add("发图用 PixivSend(作品ID)；这条作品是 " + seedId + "，共 " + GetInt(detail, "pageCount") + " 页。");
         interactor.Poke(string.Join("\n", lines));
     }
@@ -371,7 +445,7 @@ public class PixivModule(
         lines.Add("pixiv.net 直连：" + await ProbeAsync(PixivHomeUrl, ""));
         if (proxy.Length == 0)
         {
-            lines.Add("搜图·代理：未配置，按关键词搜图会失败（只发已知作品ID不受影响）");
+            lines.Add("搜图·代理：未配置，按关键词搜图会失败（只发已知作品ID照样能发，但读不到详情、分级与排除标签那道检查这次做不了）");
         }
         else
         {
@@ -391,7 +465,7 @@ public class PixivModule(
         lines.Add("pixiv.re 镜像（直连取原图）：" + await ProbeAsync(MirrorBase, ""));
         lines.Add("筛选：排除标签 " + ExcludesText()
             + "，收藏数门槛 " + (Configuration.MinBookmarks > 0 ? Configuration.MinBookmarks.ToString(CultureInfo.InvariantCulture) : "不设")
-            + "，关键词映射 " + KeywordMapTable().Count + " 条");
+            + "，关键词映射 " + KeywordMapTable().Count + " 条，R-18放行 " + (Configuration.AllowR18 ? "开（按ID直发放行）" : "关（按ID直发也拦）"));
         lines.Add("去重：最近 " + DedupWindowText() + " 发过的不再搜到，当前记录 " + LedgerCount() + " 条");
         lines.Add("图片目录：" + DescribeFolder());
         try
@@ -406,6 +480,7 @@ public class PixivModule(
         }
         lines.Add("开关：发送" + (Configuration.EnableSend ? "开" : "关")
             + "，合并转发" + (Configuration.SendAsForward ? "开" : "关")
+            + "，一次最多 " + BatchLimit + " 张，人气排翻 " + PopularPages + " 页、抽 " + SampleCount + " 条读详情"
             + "，超时 搜索" + TimeoutSeconds(false) + "秒/取图" + TimeoutSeconds(true) + "秒");
         interactor.Poke(string.Join("\n", lines));
     }
@@ -415,7 +490,7 @@ public class PixivModule(
     // ============================================================
 
     sealed record PixivHit(string Id, string Title, string UserName, int Width, int Height, int PageCount,
-        string[] Tags, bool IsAnimation, int Bookmarks);
+        string[] Tags, bool IsAnimation, int Bookmarks, int Rating);
 
     // 免登录没有服务端人气榜（实测 order/s_mode 一律被忽略、排行接口404），人气只能在本地排：
     // 多翻几页把候选池撑大，按步长取样逐条读真实收藏数再排序；order=new 就跳过这一趟直接回最新上传
@@ -425,9 +500,9 @@ public class PixivModule(
         {
             return await SearchAsync(keyword, limit, 1);
         }
-        List<PixivHit> pool = await SearchAsync(keyword, PopularityPoolSize, PopularSearchPages);
+        List<PixivHit> pool = await SearchAsync(keyword, PopularityPoolSize, PopularPages);
         List<PixivHit> kept = new();
-        foreach (PixivHit hit in Spread(pool, BookmarksProbeLimit))
+        foreach (PixivHit hit in Spread(pool, SampleCount))
         {
             PixivHit? detail = await FetchHitAsync(hit.Id);
             PixivHit checkedHit = detail == null ? hit : detail with { Title = hit.Title, UserName = hit.UserName };
@@ -490,7 +565,8 @@ public class PixivModule(
                 return null;
             }
             return new PixivHit(id, title, GetText(body, "userName"), GetInt(body, "width"), GetInt(body, "height"),
-                GetInt(body, "pageCount"), DetailTags(body), GetInt(body, "illustType") != 0, GetInt(body, "bookmarkCount"));
+                GetInt(body, "pageCount"), DetailTags(body), GetInt(body, "illustType") != 0, GetInt(body, "bookmarkCount"),
+                GetInt(body, "xRestrict"));
         }
         catch (Exception detailError)
         {
@@ -508,13 +584,14 @@ public class PixivModule(
             // 结果数组里会混进 {"isAdContainer":true} 这种广告位，它没有 id 与 url
             string id = GetText(item, "id");
             string[] tags = SearchTags(item);
-            if (id.Length == 0 || GetInt(item, "xRestrict") != 0 || Excluded(tags, excludes) || IsRecentlySent(id))
+            int rating = GetInt(item, "xRestrict");
+            if (id.Length == 0 || rating != 0 || Excluded(tags, excludes) || IsRecentlySent(id))
             {
                 continue;
             }
             hits.Add(new PixivHit(id, GetText(item, "title"), GetText(item, "userName"),
                 GetInt(item, "width"), GetInt(item, "height"), GetInt(item, "pageCount"),
-                tags, GetInt(item, "illustType") != 0, 0));
+                tags, GetInt(item, "illustType") != 0, 0, rating));
             if (hits.Count >= limit)
             {
                 break;
@@ -600,7 +677,10 @@ public class PixivModule(
 
     bool Excluded(string[] tags) => Excluded(tags, ExcludeList());
 
-    static bool Excluded(string[] tags, List<string> excludes)
+    static bool Excluded(string[] tags, List<string> excludes) => MatchedExclude(tags, excludes) != null;
+
+    // 命中哪个排除词就说哪个，拦下来的时候不用用户自己猜
+    static string? MatchedExclude(string[] tags, List<string> excludes)
     {
         foreach (string tag in tags)
         {
@@ -608,11 +688,23 @@ public class PixivModule(
             {
                 if (tag.Contains(exclude, StringComparison.OrdinalIgnoreCase))
                 {
-                    return true;
+                    return tag + "（命中排除词 " + exclude + "）";
                 }
             }
         }
-        return false;
+        return null;
+    }
+
+    // 按ID/链接直发也要过的闸门：返回拦下的理由，null=可以发。评级取自详情接口的 xRestrict（实测 0/1/2）
+    string? BlockedBy(PixivHit hit)
+    {
+        if (hit.Rating != 0 && Configuration.AllowR18 == false)
+        {
+            return "分级 " + (hit.Rating == 1 ? "R-18" : hit.Rating == 2 ? "R-18G" : "xRestrict=" + hit.Rating)
+                + "，配置「发送·放行R-18」是关的";
+        }
+        string? exclude = MatchedExclude(hit.Tags, ExcludeList());
+        return exclude == null ? null : "标签 " + exclude;
     }
 
     string ExcludesText()
@@ -839,7 +931,7 @@ public class PixivModule(
     // 发送
     // ============================================================
 
-    async Task SendAndReportAsync(PixivHit? hit, string id, int page, PixivFile file, long target, bool isGroup)
+    async Task SendAndReportAsync(PixivHit? hit, string id, int page, PixivFile file, long target, bool isGroup, string note = "")
     {
         bool success;
         string failure = "";
@@ -863,7 +955,7 @@ public class PixivModule(
         {
             "✅ 图片已发送：" + (hit == null ? "pixiv " + id : hit.Title + "／" + hit.UserName),
             "　" + id + " 第" + page + "页，" + SizeText(bytes) + (file.FromCache ? "，本地缓存，没重新下载" : "")
-                + "，" + ArtworkPageBase + id + "。这张在 " + DedupWindowText() + "内不会再被搜到。"
+                + "，" + ArtworkPageBase + id + "。这张在 " + DedupWindowText() + "内不会再被搜到。" + note
         };
         if (hit != null && hit.PageCount > page)
         {
@@ -1058,7 +1150,7 @@ public class PixivModule(
         string proxy = Configuration.ProxyUrl.Trim();
         if (proxy.Length == 0)
         {
-            throw new Exception("Pixiv 搜图要走 pixiv.net，本机实测国内直连不通，得在插件配置「搜图·代理地址」里填一个HTTP代理（如 http://127.0.0.1:7890）；用户只给了作品ID或链接的话，直接 PixivSend 就不需要代理");
+            throw new Exception("Pixiv 搜图要走 pixiv.net，本机实测国内直连不通，得在插件配置「搜图·代理地址」里填一个HTTP代理（如 http://127.0.0.1:7890）；用户只给了作品ID或链接的话不用代理也能发（PixivSend 走 pixiv.re 镜像取图），只是读不到详情、过不了分级与排除标签那道检查");
         }
         return proxy;
     }
