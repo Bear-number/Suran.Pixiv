@@ -3,7 +3,11 @@
 免登录搜 Pixiv 作品并把**原图**以QQ图片消息发出。全程不需要 Pixiv 账号：搜索走 pixiv.net 的公开接口，取图走 pixiv.re 镜像。
 
 ## 版本
-4.1.1（对应 Alife 客户端 4.2.x）
+5.0.0（对应 Alife 客户端 5.0.x；本机 5.0.2 在役客户端已热编译装载成功）
+
+## 5.0.0 的改动
+- 版本号对齐客户端主版本（官方约定：插件版本首位应与客户端一致，`PluginSystem.IsClientCompatible` 按主版本判定）
+- 纯 HTTP 与本地缓存文件，未涉及平台 API；本版只做版本对齐与在役客户端装载确认
 
 ## 依赖
 - Alife.Function.FunctionCaller
