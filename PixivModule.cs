@@ -22,24 +22,28 @@ namespace Suran.Pixiv;
 
 public class PixivConfig
 {
-    [DisplayName("协议端地址")]
-    [Description("OneBot正向WebSocket地址，图片消息从这里发出去")]
-    public string WsUrl { get; set; } = "ws://127.0.0.1:3001";
+    [DisplayName("协议端·地址")]
+    [Description("留空 = 自动跟随「QQ 聊天」插件的配置（推荐）。填了就用这里的，例如 ws://127.0.0.1:3001。图片消息从这里发出去")]
+    public string WsUrl { get; set; } = "";
+
+    [DisplayName("协议端·访问令牌")]
+    [Description("与协议端配置的 token 一致。留空 = 跟随「QQ 聊天」插件。填了地址却没填这里，协议端一开 token 就会连不上")]
+    public string OneBotToken { get; set; } = "";
 
     [DisplayName("搜图·代理地址")]
     [Description("访问 pixiv.net 搜索接口要用的HTTP代理，如 http://127.0.0.1:7890。国内直连不通，按关键词搜图必填；只发已知作品ID不用填")]
     public string ProxyUrl { get; set; } = "";
 
     [DisplayName("搜图·排除标签")]
-    [Description("命中这些标签的作品不搜也不发，多个用逗号或顿号分隔。判定是包含式：填 AI 也能挡掉 AIイラスト、AI生成。按ID或链接直发也会拦——只要配了代理、详情读得出来（没配代理时按ID直发读不到标签，只能不拦，回报里会写明这次没做检查）")]
+    [Description("命中这些标签的作品不搜也不发，多个用逗号或顿号分隔。")]
     public string ExcludeTags { get; set; } = "AI,R-18,R-18G,裸足";
 
     [DisplayName("搜图·最低收藏数")]
-    [Description("0=不筛。填上之后候选会走作品详情读真实收藏数（实测收藏数只在详情接口里给），并按步长取最多「抽几条读详情」那么多条逐条请，一次搜索因此要多花十几秒。免登录只搜得到最新上传的几页，收藏数普遍个位到几十，门槛设上百基本全军覆没")]
+    [Description("最低收藏数，0 = 不筛。")]
     public int MinBookmarks { get; set; } = 0;
 
     [DisplayName("搜图·人气翻几页")]
-    [Description("按收藏数排时先翻几页当候选池，默认3（实测每页约59条、页与页不重叠）。免登录没有服务端人气榜，只能多翻几页再本地排；翻得多排得准但更慢")]
+    [Description("按收藏数排序时先翻几页做候选池，默认 3。")]
     public int PopularPages { get; set; } = 3;
 
     [DisplayName("搜图·抽几条读详情")]
@@ -51,7 +55,7 @@ public class PixivConfig
     public string KeywordMap { get; set; } = "";
 
     [DisplayName("发送·放行R-18")]
-    [Description("默认关：PixivSend 按ID或链接直发时也会读作品详情，xRestrict 不为0（参考插件的判定：1=R-18、2=R-18G；本机免登录只实测到0）就直接拒发。未登录搜索本来就搜不到这类，只有用户自己给ID才会撞上；参考插件那套是按会话白名单放行，这里没会话概念，就做成这一个开关")]
+    [Description("是否放行 R-18 作品，默认关。")]
     public bool AllowR18 { get; set; } = false;
 
     [DisplayName("发送·一次最多几张")]
@@ -93,7 +97,8 @@ public class PixivConfig
 
 [Module("P站图片搜索发送",
     "免登录搜 Pixiv 作品并把原图以QQ图片消息发出：关键词搜图取候选、按作品ID或链接直接发、一次批量发多张（可合并转发）、取同画师的其他作品；带排除标签、收藏数门槛、中文关键词转tag、发过的自动去重、本地缓存自动清理；按ID或链接直发也会先读详情过分级与排除标签这道闸门（要配代理才读得到）",
-    defaultCategory: "苏染的工具")]
+    defaultCategory: "苏染的工具",
+    EditorUI = typeof(PixivUI))]
 public class PixivModule(
     XmlFunctionCaller functionCaller,
     ILogger<PixivModule> logger,
@@ -471,12 +476,12 @@ public class PixivModule(
         try
         {
             await ResolveProviderAsync();
-            lines.Add("协议端：" + ProviderLabel() + "，地址 " + Configuration.WsUrl
+            lines.Add("协议端：" + ProviderLabel() + "，地址 " + ResolveOneBot().Url + "（来自 " + ResolveOneBot().Source + "）"
                 + "，机器人 " + (selfNick.Length > 0 ? selfNick : "?") + "(" + selfId + ")");
         }
         catch (Exception wsError)
         {
-            lines.Add("❌ 协议端连不上（" + Configuration.WsUrl + "）：" + wsError.Message);
+            lines.Add("❌ 协议端连不上（" + ResolveOneBot().Url + "，来自 " + ResolveOneBot().Source + "）：" + wsError.Message);
         }
         lines.Add("开关：发送" + (Configuration.EnableSend ? "开" : "关")
             + "，合并转发" + (Configuration.SendAsForward ? "开" : "关")
@@ -1087,6 +1092,65 @@ public class PixivModule(
         }
     }
 
+    /// <summary>
+    /// 协议端连接信息。
+    ///
+    /// 地址留空时跟随「QQ 聊天」插件的配置——那是唯一值得人填一次的地方。
+    /// 换端口、给协议端开 token，都不用回来改这个插件，读它的配置就够。
+    /// 读不到就退回上一个版本的默认值，行为和以前完全一致。
+    /// </summary>
+    (string Url, string Token, string Source) ResolveOneBot()
+    {
+        string url = (Configuration.WsUrl ?? "").Trim();
+        string token = (Configuration.OneBotToken ?? "").Trim();
+
+        if (url.Length > 0)
+            return (url, token, "本插件");
+
+        // 按角色存，所以换角色读的是那个角色自己的 QQ 配置——不同角色可能是不同 bot 账号，这是对的。
+        // 第二条是兜底：StorageFolderPath 若已含角色层、或 StorageKey 为空，靠第一条拼不出来。
+        string[] candidates =
+        [
+            Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey,
+                "Configuration", "Alife.Function.QChat.QChatService.json"),
+            Path.Combine(AlifePath.StorageFolderPath,
+                "Configuration", "Alife.Function.QChat.QChatService.json"),
+        ];
+
+        foreach (string path in candidates)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                    continue;
+
+                using JsonDocument document = JsonDocument.Parse(File.ReadAllText(path));
+                string sharedUrl = document.RootElement.TryGetProperty("Url", out JsonElement u) ? u.GetString() ?? "" : "";
+                string sharedToken = document.RootElement.TryGetProperty("Token", out JsonElement t) ? t.GetString() ?? "" : "";
+                if (sharedUrl.Trim().Length > 0)
+                    return (sharedUrl.Trim(), token.Length > 0 ? token : sharedToken.Trim(), "QQ 聊天插件");
+            }
+            catch (Exception)
+            {
+                // 这个候选读不了就试下一个。配置坏了也不该让发消息失败在读取配置上
+            }
+        }
+
+        return ("ws://127.0.0.1:3001", token, "默认");
+    }
+
+    /// <summary>
+    /// 建连并鉴权。
+    /// token 必须在 ConnectAsync 之前写进请求头——连上之后 ClientWebSocket 不允许再改 Options。
+    /// </summary>
+    async Task ConnectOneBotAsync(ClientWebSocket connection, CancellationToken cancellationToken)
+    {
+        (string url, string token, _) = ResolveOneBot();
+        if (token.Length > 0)
+            connection.Options.SetRequestHeader("Authorization", "Bearer " + token);
+        await connection.ConnectAsync(new Uri(url), cancellationToken);
+    }
+
     async Task<(int Retcode, string Message, JsonElement Data)> SendActionOnceAsync(string action, JsonObject parameters)
     {
         if (sharedWs == null || sharedWs.State != WebSocketState.Open)
@@ -1094,7 +1158,7 @@ public class PixivModule(
             sharedWs?.Dispose();
             ClientWebSocket connection = new();
             using CancellationTokenSource connectTimeout = new(TimeSpan.FromSeconds(10));
-            await connection.ConnectAsync(new Uri(Configuration.WsUrl), connectTimeout.Token);
+            await ConnectOneBotAsync(connection, connectTimeout.Token);
             sharedWs = connection;
         }
         string echo = Guid.NewGuid().ToString();
