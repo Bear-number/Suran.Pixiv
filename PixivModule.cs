@@ -97,7 +97,7 @@ public class PixivConfig
 
 [Module("P站图片搜索发送",
     "免登录搜 Pixiv 作品并把原图以QQ图片消息发出：关键词搜图取候选、按作品ID或链接直接发、一次批量发多张（可合并转发）、取同画师的其他作品；带排除标签、收藏数门槛、中文关键词转tag、发过的自动去重、本地缓存自动清理；按ID或链接直发也会先读详情过分级与排除标签这道闸门（要配代理才读得到）",
-    defaultCategory: "苏染的工具",
+    defaultCategory: "苏染的工具/媒体与分享",
     EditorUI = typeof(PixivUI))]
 public class PixivModule(
     XmlFunctionCaller functionCaller,
@@ -118,6 +118,8 @@ public class PixivModule(
     const int MaxResults = 20;
     const int ProbeTimeoutSeconds = 8;
     const int PopularityPoolSize = 120;
+    const long MaxImageBytes = 50 * 1024 * 1024;
+    const long MaxJsonBytes = 4 * 1024 * 1024;
 
     // 免登录没有人气排序，只能把最新上传的前几页当候选池本地排（实测 p=1..3 各回约59条且不重叠）
     int PopularPages => Math.Clamp(Configuration.PopularPages, 1, 5);
@@ -135,12 +137,14 @@ public class PixivModule(
         ["明日方舟"] = "アークナイツ", ["FGO"] = "Fate/GrandOrder", ["初音"] = "初音ミク"
     };
 
-    static ClientWebSocket? sharedWs;
-    static readonly SemaphoreSlim wsLock = new(1, 1);
-    static string providerName = "";
-    static bool providerResolved;
-    static string selfId = "";
-    static string selfNick = "";
+    // 连接按实例持有：多角色共用一个 static 连接会连到别的角色的 bot 账号，
+    // 角色卸载时也容易把别人正在用的 socket 带走
+    ClientWebSocket? sharedWs;
+    readonly SemaphoreSlim wsLock = new(1, 1);
+    string providerName = "";
+    bool providerResolved;
+    string selfId = "";
+    string selfNick = "";
 
     readonly Dictionary<string, long> sentLedger = new();
     readonly object ledgerLock = new();
@@ -163,6 +167,21 @@ public class PixivModule(
         };
         functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
         return Task.CompletedTask;
+    }
+
+    protected override async Task OnDestroy()
+    {
+        await wsLock.WaitAsync();
+        try
+        {
+            sharedWs?.Dispose();
+            sharedWs = null;
+            providerResolved = false;
+        }
+        finally
+        {
+            wsLock.Release();
+        }
     }
 
     // ============================================================
@@ -236,7 +255,9 @@ public class PixivModule(
             }
             if (hit == null)
             {
-                note = "（没配代理或详情没读到，这条没做分级与排除标签检查）";
+                note = Configuration.ProxyUrl.Trim().Length > 0
+                    ? "（配了代理但详情没读到，这条没做分级与排除标签检查）"
+                    : "（没配代理，读不到详情，这条没做分级与排除标签检查）";
             }
             else
             {
@@ -286,15 +307,35 @@ public class PixivModule(
         CleanupCache();
         List<(PixivHit Hit, PixivFile File)> ready = new();
         List<string> skipped = new();
-        foreach (PixivHit hit in hits)
+        // 多图一次要下好几张，串行时总时长是单张之和；限 3 路并发，失败照旧逐条记原因
+        using SemaphoreSlim downloadGate = new(3, 3);
+        List<Task<(PixivHit Hit, PixivFile? File, string Error)>> downloads = hits
+            .Select(async hit =>
+            {
+                await downloadGate.WaitAsync(DestroyCancellationToken);
+                try
+                {
+                    return (hit, (PixivFile?)await DownloadAsync(hit.Id, 1), "");
+                }
+                catch (Exception downloadError)
+                {
+                    return (hit, null, downloadError.Message);
+                }
+                finally
+                {
+                    downloadGate.Release();
+                }
+            })
+            .ToList();
+        foreach ((PixivHit hit, PixivFile? file, string error) in await Task.WhenAll(downloads))
         {
-            try
+            if (file == null)
             {
-                ready.Add((hit, await DownloadAsync(hit.Id, 1)));
+                skipped.Add(hit.Id + "：" + error);
             }
-            catch (Exception downloadError)
+            else
             {
-                skipped.Add(hit.Id + "：" + downloadError.Message);
+                ready.Add((hit, file));
             }
         }
         if (ready.Count == 0)
@@ -380,7 +421,7 @@ public class PixivModule(
         }
 
         JsonElement detail = await GetJsonAsync(IllustBase + seedId, RequireProxy(), TimeoutSeconds(false));
-        string artist = GetText(detail, "userName");
+        string artist = SafeText(GetText(detail, "userName"), 80);
         int want = Math.Clamp(count, 1, MaxResults);
         List<string> verified = new();
         List<string> unverified = new();
@@ -506,10 +547,30 @@ public class PixivModule(
             return await SearchAsync(keyword, limit, 1);
         }
         List<PixivHit> pool = await SearchAsync(keyword, PopularityPoolSize, PopularPages);
+        List<PixivHit> sampled = Spread(pool, SampleCount);
+        // 抽样读详情最多 20 条，串行时每条都可能等满超时；限 3 路并发，最坏等待能降一个数量级
+        using SemaphoreSlim probeGate = new(3, 3);
+        List<Task<PixivHit?>> probes = sampled
+            .Select(async hit =>
+            {
+                await probeGate.WaitAsync(DestroyCancellationToken);
+                try
+                {
+                    return await FetchHitAsync(hit.Id);
+                }
+                finally
+                {
+                    probeGate.Release();
+                }
+            })
+            .ToList();
+        PixivHit?[] details = await Task.WhenAll(probes);
         List<PixivHit> kept = new();
-        foreach (PixivHit hit in Spread(pool, SampleCount))
+        for (int index = 0; index < sampled.Count; index++)
         {
-            PixivHit? detail = await FetchHitAsync(hit.Id);
+            PixivHit hit = sampled[index];
+            PixivHit? detail = details[index];
+            // 详情拿不到就退回搜索数据，但搜索数据没有收藏数，所以只在门槛为 0 时才可能留下
             PixivHit checkedHit = detail == null ? hit : detail with { Title = hit.Title, UserName = hit.UserName };
             if (Excluded(checkedHit.Tags) == false && checkedHit.Bookmarks >= Configuration.MinBookmarks)
             {
@@ -575,7 +636,7 @@ public class PixivModule(
         }
         catch (Exception detailError)
         {
-            logger.LogInformation("[Pixiv] 取作品 {Id} 详情失败，只按ID发送：{Error}", id, detailError.Message);
+            logger.LogDebug("[Pixiv] 取作品 {Id} 详情失败：{Error}", id, detailError.Message);
             return null;
         }
     }
@@ -590,7 +651,8 @@ public class PixivModule(
             string id = GetText(item, "id");
             string[] tags = SearchTags(item);
             int rating = GetInt(item, "xRestrict");
-            if (id.Length == 0 || rating != 0 || Excluded(tags, excludes) || IsRecentlySent(id))
+            // 关闭 R-18 放行时连搜索候选也不给；开了就交给 BlockedBy 统一判断，两处语义要一致
+            if (id.Length == 0 || (rating != 0 && Configuration.AllowR18 == false) || Excluded(tags, excludes) || IsRecentlySent(id))
             {
                 continue;
             }
@@ -636,11 +698,13 @@ public class PixivModule(
 
     string Describe(PixivHit hit)
     {
-        return hit.Id + " " + hit.Title + "／" + hit.UserName + "  " + hit.Width + "x" + hit.Height
+        // 标题/作者/标签来自P站页面，压成单行并限长，避免外部文本带换行或夹带指令
+        return hit.Id + " " + SafeText(hit.Title, 120) + "／" + SafeText(hit.UserName, 60)
+            + "  " + hit.Width + "x" + hit.Height
             + (hit.PageCount > 1 ? " " + hit.PageCount + "P" : "")
             + (hit.IsAnimation ? " 动图(只能取静帧)" : "")
             + (hit.Bookmarks > 0 ? " 收藏" + hit.Bookmarks : "")
-            + (hit.Tags.Length > 0 ? "  标签: " + string.Join("、", hit.Tags.Take(3)) : "");
+            + (hit.Tags.Length > 0 ? "  标签: " + SafeText(string.Join("、", hit.Tags.Take(3)), 120) : "");
     }
 
     // ============================================================
@@ -831,7 +895,11 @@ public class PixivModule(
         {
             record[entry.Key] = entry.Value;
         }
-        File.WriteAllText(LedgerPath, record.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        // 原子替换：写到一半崩了不会留下半截 JSON，下次启动就不会把去重记录整份清空
+        string path = LedgerPath;
+        string temp = path + ".tmp";
+        File.WriteAllText(temp, record.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        File.Move(temp, path, true);
     }
 
     string DedupWindowText() => Configuration.DedupExpireHours <= 0 ? "永久以来" : Configuration.DedupExpireHours + "小时以来";
@@ -844,7 +912,24 @@ public class PixivModule(
 
     sealed record PixivFile(string Path, bool FromCache);
 
-    string ImageFolderPath() => Path.Combine(AlifePath.StorageFolderPath, Configuration.ImageFolder.Trim());
+    /// <summary>
+    /// 图片目录必须落在 Storage 里面：配置填了绝对路径或 ..\.. 时，清理逻辑会去删 Storage 外的图片。
+    /// 非法路径直接回落到默认 Pixiv 目录。
+    /// </summary>
+    string ImageFolderPath()
+    {
+        string root = Path.GetFullPath(AlifePath.StorageFolderPath);
+        string configured = (Configuration.ImageFolder ?? "").Trim();
+        if (configured.Length == 0 || Path.IsPathRooted(configured))
+        {
+            return Path.Combine(root, "Pixiv");
+        }
+        string folder = Path.GetFullPath(Path.Combine(root, configured));
+        string rootWithSeparator = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return folder.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase)
+            ? folder
+            : Path.Combine(root, "Pixiv");
+    }
 
     void CleanupCache()
     {
@@ -897,15 +982,36 @@ public class PixivModule(
         // 镜像扩展名只是占位：实测回的类型跟着原作品走（PNG作品就回 image/png），真类型只能看 Content-Type。
         // 第1页必须用 {id}.jpg —— {id}-1.jpg 这种写法实测对部分作品直接404，第2页起才带页码
         string url = MirrorBase + id + (page > 1 ? "-" + page : "") + ".jpg";
-        using HttpClient client = NewHttpClient("", TimeoutSeconds(true));
+        HttpClient client = SharedHttpClient("", TimeoutSeconds(true));
         using HttpResponseMessage response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, DestroyCancellationToken);
         if (response.IsSuccessStatusCode == false)
         {
             throw new Exception("pixiv.re 回 " + (int)response.StatusCode + "：" + MirrorHint((int)response.StatusCode, id, page));
         }
         string extension = ExtensionOf(response.Content.Headers.ContentType?.MediaType ?? "");
+        // 有大小上限：镜像偶尔会回异常大的文件，整包读进内存前先拦住
+        long? declared = response.Content.Headers.ContentLength;
+        if (declared.HasValue && declared.Value > MaxImageBytes)
+        {
+            throw new Exception("镜像回的图超过 " + SizeText(MaxImageBytes) + " 上限（" + SizeText(declared.Value) + "），已中止");
+        }
         // 先读满再一次性落盘，超时或半途失败时不会留下半个文件被下次当成缓存
-        byte[] image = await response.Content.ReadAsByteArrayAsync(DestroyCancellationToken);
+        byte[] image;
+        using (Stream stream = await response.Content.ReadAsStreamAsync(DestroyCancellationToken))
+        using (MemoryStream buffer = new())
+        {
+            byte[] chunk = new byte[8192];
+            int read;
+            while ((read = await stream.ReadAsync(chunk.AsMemory(0, chunk.Length), DestroyCancellationToken)) > 0)
+            {
+                if (buffer.Length + read > MaxImageBytes)
+                {
+                    throw new Exception("镜像回的图超过 " + SizeText(MaxImageBytes) + " 上限，已中止");
+                }
+                buffer.Write(chunk, 0, read);
+            }
+            image = buffer.ToArray();
+        }
         if (image.Length == 0)
         {
             throw new Exception("pixiv.re 回的是空文件");
@@ -1065,6 +1171,9 @@ public class PixivModule(
         selfNick = GetText(login, "nickname");
     }
 
+    /// <summary>请求还没写进 socket 就失败了，可以安全重连再试；写进去之后的失败不能重发，否则会重复。</summary>
+    sealed class SendBeforeWriteException(string message) : Exception(message);
+
     async Task<(int Retcode, string Message, JsonElement Data)> SendActionAsync(string action, JsonObject parameters)
     {
         await wsLock.WaitAsync();
@@ -1077,11 +1186,16 @@ public class PixivModule(
                 {
                     return await SendActionOnceAsync(action, parameters);
                 }
-                catch (Exception attemptError)
+                catch (SendBeforeWriteException beforeWrite)
                 {
-                    lastError = attemptError;
+                    lastError = beforeWrite;
                     sharedWs?.Dispose();
                     sharedWs = null;
+                }
+                catch (Exception afterWrite)
+                {
+                    // 已经发出去了，只是没等到 echo：图片可能已经送达，重发会变成两张
+                    throw new Exception(action + " 已发出但没等到响应（可能已送达，为避免重复不再重发）：" + afterWrite.Message);
                 }
             }
             throw new Exception(action + " 失败：" + lastError!.Message);
@@ -1155,11 +1269,18 @@ public class PixivModule(
     {
         if (sharedWs == null || sharedWs.State != WebSocketState.Open)
         {
-            sharedWs?.Dispose();
-            ClientWebSocket connection = new();
-            using CancellationTokenSource connectTimeout = new(TimeSpan.FromSeconds(10));
-            await ConnectOneBotAsync(connection, connectTimeout.Token);
-            sharedWs = connection;
+            try
+            {
+                sharedWs?.Dispose();
+                ClientWebSocket connection = new();
+                using CancellationTokenSource connectTimeout = new(TimeSpan.FromSeconds(10));
+                await ConnectOneBotAsync(connection, connectTimeout.Token);
+                sharedWs = connection;
+            }
+            catch (Exception connectError)
+            {
+                throw new SendBeforeWriteException("连不上协议端：" + connectError.Message);
+            }
         }
         string echo = Guid.NewGuid().ToString();
         JsonObject payload = new()
@@ -1170,8 +1291,15 @@ public class PixivModule(
         };
         using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(60));
         byte[] receiveBuffer = new byte[64 * 1024];
-        await sharedWs.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload.ToJsonString())),
-            WebSocketMessageType.Text, true, timeout.Token);
+        try
+        {
+            await sharedWs.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload.ToJsonString())),
+                WebSocketMessageType.Text, true, timeout.Token);
+        }
+        catch (Exception sendError)
+        {
+            throw new SendBeforeWriteException("消息没发出去：" + sendError.Message);
+        }
         while (timeout.IsCancellationRequested == false)
         {
             MemoryStream buffer = new();
@@ -1231,28 +1359,50 @@ public class PixivModule(
         return Regex.IsMatch(text, @"^\d+$") ? text : "";
     }
 
-    static HttpClient NewHttpClient(string proxy, int timeoutSeconds)
+    // 按「代理 + 超时」缓存客户端：每次请求都 new 一个会把连接池用废，P站搜索又要连着打十几条
+    static readonly Dictionary<string, HttpClient> httpClients = new();
+
+    static HttpClient SharedHttpClient(string proxy, int timeoutSeconds)
     {
-        HttpClientHandler handler = new();
-        if (proxy.Trim().Length > 0)
+        string key = proxy.Trim() + "|" + timeoutSeconds;
+        lock (httpClients)
         {
-            handler.UseProxy = true;
-            handler.Proxy = new WebProxy(proxy.Trim());
+            if (httpClients.TryGetValue(key, out HttpClient? existing))
+            {
+                return existing;
+            }
+            HttpClientHandler handler = new();
+            if (proxy.Trim().Length > 0)
+            {
+                handler.UseProxy = true;
+                handler.Proxy = new WebProxy(proxy.Trim());
+            }
+            HttpClient client = new(handler) { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
+            httpClients[key] = client;
+            return client;
         }
-        HttpClient client = new(handler) { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd(BrowserUserAgent);
-        return client;
     }
 
     async Task<JsonElement> GetJsonAsync(string url, string proxy, int timeoutSeconds)
     {
-        using HttpClient client = NewHttpClient(proxy, timeoutSeconds);
+        HttpClient client = SharedHttpClient(proxy, timeoutSeconds);
         using HttpResponseMessage response = await client.GetAsync(url, DestroyCancellationToken);
         if (response.IsSuccessStatusCode == false)
         {
             throw new Exception("Pixiv 接口回 HTTP " + (int)response.StatusCode);
         }
-        using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(DestroyCancellationToken));
+        long? declared = response.Content.Headers.ContentLength;
+        if (declared.HasValue && declared.Value > MaxJsonBytes)
+        {
+            throw new Exception("Pixiv 接口响应过大（" + SizeText(declared.Value) + "），已中止");
+        }
+        byte[] bytes = await response.Content.ReadAsByteArrayAsync(DestroyCancellationToken);
+        if (bytes.Length > MaxJsonBytes)
+        {
+            throw new Exception("Pixiv 接口响应超过 " + SizeText(MaxJsonBytes) + " 上限，已中止");
+        }
+        using JsonDocument document = JsonDocument.Parse(Encoding.UTF8.GetString(bytes));
         JsonElement root = document.RootElement.Clone();
         if (root.TryGetProperty("error", out JsonElement error) && error.ValueKind == JsonValueKind.True)
         {
@@ -1273,7 +1423,7 @@ public class PixivModule(
 
     async Task<string> ProbeAsync(string url, string proxy)
     {
-        using HttpClient client = NewHttpClient(proxy, ProbeTimeoutSeconds);
+        HttpClient client = SharedHttpClient(proxy, ProbeTimeoutSeconds);
         try
         {
             using HttpResponseMessage response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, DestroyCancellationToken);
@@ -1317,6 +1467,20 @@ public class PixivModule(
     {
         string oneLine = Regex.Replace(text, "\\s+", " ").Trim();
         return oneLine.Length > 300 ? oneLine[..300] + "…" : oneLine;
+    }
+
+    /// <summary>外部文本进提示词前统一清洗：去标签、控制字符与双向覆盖符，压单行并限长。</summary>
+    static string SafeText(string? value, int max)
+    {
+        string text = value ?? "";
+        if (text.Length == 0)
+        {
+            return "";
+        }
+        text = Regex.Replace(text, "<[^>]*>", " ");
+        text = Regex.Replace(text, @"[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069]", " ");
+        text = Regex.Replace(text, @"\s+", " ").Trim();
+        return max > 0 && text.Length > max ? text[..max] + "…" : text;
     }
 
     static string GetText(JsonElement element, string name)
